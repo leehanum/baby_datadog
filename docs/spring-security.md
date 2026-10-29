@@ -174,3 +174,78 @@ jjwt의 예외는 모두 `JwtException`을 상속하므로, 위 코드처럼 만
 | `claims.get("memberId", Long.class)` | `1` (정상) |
 
 토큰 payload는 JSON이라 숫자의 원래 타입 정보가 없고, Jackson은 작은 숫자를 `Integer`로 읽는다. 커스텀 claim에서 숫자를 꺼낼 때는 캐스팅하지 말고 `get(name, Long.class)`처럼 타입을 넘겨야 한다.
+
+## 3. 401과 403 나누기: AuthenticationEntryPoint vs AccessDeniedHandler
+
+JWT 필터까지 만들고 나면, 막힌 요청에 어떤 응답을 줄지 정해야 한다. 참고 글은 핸들러를 두 개 만든다. 이름이 비슷해서 처음엔 헷갈렸는데, 기준은 하나다. **"누구인지 모르면" EntryPoint, "누구인지는 아는데 권한이 없으면" AccessDeniedHandler**다.
+
+| | `CustomAuthenticationEntryPoint` | `CustomAccessDeniedHandler` |
+|---|---|---|
+| 상황 | 인증 실패 (토큰 없음, 만료, 위조) | 인증은 됐지만 권한 부족 (USER가 ADMIN API 호출) |
+| 구현 인터페이스 | `AuthenticationEntryPoint` | `AccessDeniedHandler` |
+| 메서드 | `commence(...)` | `handle(...)` |
+| 응답 | 401 UNAUTHORIZED | 403 FORBIDDEN |
+
+EntryPoint라는 이름은 원래 폼 로그인 시절, 미인증 사용자를 로그인 페이지로 보내 "인증을 시작하게 하는 입구"라는 뜻에서 왔다. JWT 기반 REST API에는 로그인 페이지가 없으니, 리다이렉트 대신 401 JSON을 내려주도록 직접 구현한다.
+
+### 두 핸들러는 등록해야 동작한다
+
+`@Component`를 붙이면 빈으로 등록되지만, Security가 그 빈을 알아서 가져다 쓰지는 않는다. `SecurityConfig`에서 예외 처리 담당으로 지정해야 한다.
+
+```java
+http.exceptionHandling(exceptionHandling -> exceptionHandling
+		.authenticationEntryPoint(customAuthenticationEntryPoint)
+		.accessDeniedHandler(accessDeniedHandler));
+```
+
+### 401과 403은 누가 어떻게 가르나
+
+여기가 가장 헷갈렸던 부분이다. 직관적으로는 "인증 실패 예외"와 "권한 부족 예외"가 따로 터질 것 같지만, 인가 검사에서 막히면 **두 경우 모두 `AccessDeniedException`이 던져진다.** 이 예외를 잡아서 어느 핸들러로 보낼지 정하는 건 `ExceptionTranslationFilter`다.
+
+Security 7.1.1의 기본 필터 순서를 확인해 보면 관련 필터는 이 순서로 놓인다. `JwtAuthFilter`는 `addFilterBefore`로 `UsernamePasswordAuthenticationFilter` 앞에 넣었다.
+
+```
+JwtAuthFilter                    토큰이 유효하면 SecurityContext에 인증 정보 저장
+→ AnonymousAuthenticationFilter  SecurityContext가 비어 있으면 익명 사용자로 채움
+→ ExceptionTranslationFilter     뒤에서 올라온 예외를 잡아 401/403 분기
+→ AuthorizationFilter            URL 권한 검사, 실패하면 AccessDeniedException
+→ 컨트롤러(@PreAuthorize)        메서드 권한 검사, 실패하면 AccessDeniedException
+```
+
+`ExceptionTranslationFilter`가 인가 검사보다 **앞**에 있어서, 뒤에서 터진 예외가 거슬러 올라오다 여기서 잡힌다. 7.1.1 jar의 `handleAccessDeniedException`을 `javap`로 열어보니 분기는 이랬다.
+
+```java
+// 단순화한 흐름
+if (trustResolver.isAnonymous(authentication) || trustResolver.isRememberMe(authentication)) {
+	// InsufficientAuthenticationException으로 감싸서
+	sendStartAuthentication(...);        // → AuthenticationEntryPoint → 401
+} else {
+	accessDeniedHandler.handle(...);     // → AccessDeniedHandler → 403
+}
+```
+
+결국 401과 403을 가르는 건 예외 종류가 아니라 **그 순간 SecurityContext에 인증된 사용자가 있느냐**다. 그리고 이걸 채우는 게 `JwtAuthFilter`다. 한 요청에서 두 핸들러가 함께 불리는 일은 없고, 인증 여부를 먼저 보기 때문에 미인증 사용자는 403까지 가지 않고 401로 끝난다.
+
+| 요청 (`@PreAuthorize("hasRole('ADMIN')")` API) | SecurityContext | 처리 |
+|---|---|---|
+| 토큰 없음 / 만료 | 익명 사용자 | EntryPoint → 401 |
+| USER 토큰 | `ROLE_USER` | AccessDeniedHandler → 403 |
+| ADMIN 토큰 | `ROLE_ADMIN` | 통과 |
+
+### 실수하기 쉬운 부분: 본문과 상태 코드는 따로 설정된다
+
+`AccessDeniedHandler`를 작성하면서 처음에 이렇게 써 두었다.
+
+```java
+ErrorResponseDto errorResponseDto = new ErrorResponseDto(HttpStatus.FORBIDDEN.value(), ...);
+response.setStatus(HttpStatus.UNAUTHORIZED.value());
+```
+
+`ErrorResponseDto`의 status는 JSON 본문에 들어가는 숫자일 뿐이고, 클라이언트가 실제로 받는 HTTP 상태 코드는 `response.setStatus()`로 정해진다. 이대로면 권한이 없는 사용자에게 상태 코드 401이 나간다. 프론트가 401을 보고 로그인 페이지로 보내는 식으로 분기하면, 이미 로그인한 사용자가 다시 로그인하라는 안내를 받게 된다. 두 곳 모두 `FORBIDDEN`으로 맞췄다.
+
+`@Slf4j(topic = "FORBIDDEN_EXCEPTION_HANDLER")`의 topic은 로그에 찍히는 로거 이름일 뿐이라 상태 코드와는 관계가 없다.
+
+### 참고 글과 달라진 점
+
+- **Jackson 3:** Boot 4는 Jackson 3를 쓰기 때문에 핸들러에서 쓰는 `ObjectMapper`의 패키지가 `com.fasterxml.jackson.databind`가 아니라 `tools.jackson.databind`다.
+- **`@EnableGlobalMethodSecurity`:** 7.1.1 jar에 아직 남아 있어서 컴파일은 되지만 deprecated다. 대체 어노테이션은 `@EnableMethodSecurity`이고, `prePostEnabled`가 기본값 true라 `@EnableMethodSecurity(securedEnabled = true)`면 된다.

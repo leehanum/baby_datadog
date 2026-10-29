@@ -17,11 +17,11 @@ import java.io.IOException;
 import java.time.LocalDateTime;
 
 /**
- * Spring Security에서 인증되지 않은 사용자가 보호된 리소스에 접근할 때 호출되는 핸들러
- * comment 메서드: 클라이언트의 요청 및 응답, 인증 예외 객체를 받음
- *  1. 인증되지 않은 접근 시 로그 기록\
- *  2. ErrorResponseDto 객체를 생성하여 HTTP 상태코드, 예외 메세제, 현재 시간을 포함
- *  3. 객체를 JSON 형식으로 직렬화하여 응답 본문에 작성하고 응답 상태 코드를 401 UNAUTHORIZED으로 설정
+ * Spring Security에서 권한이 부족하여 접근이 거부될 때 호출되는 핸들러
+ *  handle 메서드: 매개변수로 클라이언트의 요청 및 응답, 접근 거부 예외 객체를 받으
+ *   1. 접근 거부가 발생하면 로그 기록
+ *   2. ErrorResponseDto 객체를 생성하여 HTTP 상태코드, 예외 메세지, 현재 시간을 포함
+ *   3. 객체를 JSON 형식으로 직렬화하여 응답 본문에 작성하고 응답 상태 코드를 403 FORBIDDEN으로 설정
  */
 @Slf4j(topic = "FORBIDDEN_EXCEPTION_HANDLER")
 @AllArgsConstructor
@@ -40,7 +40,7 @@ public class CustomAccessDeniedHandler implements AccessDeniedHandler {
 
         String responseBody = objectMapper.writeValueAsString(errorResponseDto);
         response.setContentType(MediaType.APPLICATION_JSON_VALUE);
-        response.setStatus(HttpStatus.UNAUTHORIZED.value());
+        response.setStatus(HttpStatus.FORBIDDEN.value());
         response.setCharacterEncoding("UTF-8");
         response.getWriter().write(responseBody);
     }
