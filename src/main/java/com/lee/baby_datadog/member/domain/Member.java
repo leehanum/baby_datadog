@@ -30,6 +30,14 @@ public class Member {
     @Column(name = "ROLE", nullable = false)
     private RoleType role;
 
+    @Builder
+    public Member(String email, String password, String name, RoleType role){
+        this.email = email;
+        this.password = password;
+        this.name = name;
+        this.role = role;
+    }
+
     public void updatePassword(String password){
         this.password = password;
     }

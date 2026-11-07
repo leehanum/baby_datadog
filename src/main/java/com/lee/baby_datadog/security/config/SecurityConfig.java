@@ -9,12 +9,11 @@ import lombok.AllArgsConstructor;
 import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Configuration;
 import org.springframework.security.config.Customizer;
-import org.springframework.security.config.annotation.method.configuration.EnableGlobalMethodSecurity;
+import org.springframework.security.config.annotation.method.configuration.EnableMethodSecurity;
 import org.springframework.security.config.annotation.web.builders.HttpSecurity;
 import org.springframework.security.config.annotation.web.configuration.EnableWebSecurity;
 import org.springframework.security.config.annotation.web.configurers.AbstractHttpConfigurer;
 import org.springframework.security.config.http.SessionCreationPolicy;
-import org.springframework.security.web.AuthenticationEntryPoint;
 import org.springframework.security.web.SecurityFilterChain;
 import org.springframework.security.web.authentication.UsernamePasswordAuthenticationFilter;
 
@@ -22,7 +21,7 @@ import org.springframework.security.web.authentication.UsernamePasswordAuthentic
 @EnableWebSecurity
 //메서드 수준에서의 보안 처리 활성화
 //@Secure, @PreAuthorize 어노테이션 사용 가능
-@EnableGlobalMethodSecurity(securedEnabled = true, prePostEnabled = true)
+@EnableMethodSecurity(securedEnabled = true)
 @AllArgsConstructor
 public class SecurityConfig {
 
@@ -32,7 +31,7 @@ public class SecurityConfig {
     private final CustomAuthenticationEntryPoint customAuthenticationEntryPoint;
 
     private static final String[] AUTH_WHITELIST = {"/member/login", "/member/signup",
-            "/swagger-ui/**", "/api-docs", "swagger-ui-custom.html"};
+            "/swagger-ui/**", "/api-docs", "/swagger-ui-custom.html"};
 
     @Bean
     public SecurityFilterChain filterChain(HttpSecurity http) throws Exception{

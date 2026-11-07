@@ -1,5 +1,6 @@
 package com.lee.baby_datadog.member.dto;
 
+import com.lee.baby_datadog.member.domain.Member;
 import com.lee.baby_datadog.member.domain.RoleType;
 import jakarta.validation.constraints.Email;
 import jakarta.validation.constraints.NotBlank;
@@ -22,5 +23,12 @@ public class MemberRequestDto {
     @NotBlank(message = "닉네임은 필수 입력 값입니다.")
     private String name;
 
-    private RoleType role;
+    public Member toEntity(){
+        return Member.builder()
+                .email(email)
+                .password(password)
+                .name(name)
+                .role(RoleType.USER)
+                .build();
+    }
 }

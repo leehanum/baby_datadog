@@ -249,3 +249,46 @@ response.setStatus(HttpStatus.UNAUTHORIZED.value());
 
 - **Jackson 3:** Boot 4는 Jackson 3를 쓰기 때문에 핸들러에서 쓰는 `ObjectMapper`의 패키지가 `com.fasterxml.jackson.databind`가 아니라 `tools.jackson.databind`다.
 - **`@EnableGlobalMethodSecurity`:** 7.1.1 jar에 아직 남아 있어서 컴파일은 되지만 deprecated다. 대체 어노테이션은 `@EnableMethodSecurity`이고, `prePostEnabled`가 기본값 true라 `@EnableMethodSecurity(securedEnabled = true)`면 된다.
+
+## 4. 회원가입 확인
+
+### role은 요청에서 받지 않는다
+
+회원가입 요청 DTO에 `role` 필드를 두면 클라이언트가 `"role": "ADMIN"`을 보내 관리자로 가입할 수 있다. 요청 DTO에서는 role을 빼고, 엔티티로 바꿀 때 서버에서 고정했다.
+
+```java
+public Member toEntity() {
+	return Member.builder()
+			.email(email)
+			.password(password)
+			.name(name)
+			.role(RoleType.USER)
+			.build();
+}
+```
+
+### DB에서 직접 확인
+
+Postman으로 `POST /member/signup`을 보낸 뒤 Docker의 MySQL에서 확인했다.
+
+```bash
+docker exec -it baby-mysql mysql -uroot -proot baby_datadog
+```
+
+```
+mysql> select member_id, email, left(password, 10) as pw, name, role from member;
+member_id  email          pw          name  role
+1          test@test.com  $2a$10$CiF  lee   USER
+```
+
+비밀번호는 BCrypt 해시(`$2a$10$...`)로, role은 `USER`로 저장됐다. BCrypt는 되돌릴 수 없는 해시라 로그인할 때는 복호화가 아니라 `passwordEncoder.matches(입력값, 저장된 해시)`로 비교한다.
+
+### 함정: `@Table(name = "MEMBER")`인데 `MEMBER` 테이블이 없다
+
+엔티티에 `@Table(name = "MEMBER")`로 적어 두어서 SQL도 대문자로 쳤더니 에러가 났다.
+
+```
+ERROR 1146 (42S02): Table 'baby_datadog.MEMBER' doesn't exist
+```
+
+`show tables`로 보면 실제 테이블 이름은 소문자 `member`다. Spring Boot가 기본으로 쓰는 Hibernate 네이밍 전략이 테이블·컬럼 이름을 소문자 snake_case로 바꾸기 때문이다. 그리고 Docker의 MySQL은 Linux 위에서 돌아서 테이블 이름의 대소문자를 구분한다. 결국 `@Table`에 뭐라고 적었든, DB에 직접 쿼리할 때는 `show tables`로 실제 이름을 확인하는 게 빠르다.

@@ -6,7 +6,6 @@ import com.lee.baby_datadog.member.dto.MemberRequestDto;
 import com.lee.baby_datadog.member.service.MemberService;
 import jakarta.validation.Valid;
 import lombok.RequiredArgsConstructor;
-import org.modelmapper.ModelMapper;
 import org.springframework.http.HttpStatus;
 import org.springframework.http.ResponseEntity;
 import org.springframework.web.bind.annotation.PostMapping;
@@ -20,7 +19,6 @@ import org.springframework.web.bind.annotation.RestController;
 public class MemberController {
 
     private final MemberService memberService;
-    private final ModelMapper   modelMapper;
 
     @PostMapping("login")
     public ResponseEntity<String> getMemberProfile(
@@ -30,9 +28,9 @@ public class MemberController {
         return ResponseEntity.status(HttpStatus.OK).body(token);
     }
 
-    @PostMapping("siginup")
+    @PostMapping("signup")
     public ResponseEntity<Long> signup(@Valid @RequestBody MemberRequestDto member){
-        Member entity = modelMapper.map(member, Member.class);
+        Member entity = member.toEntity();
         Long id = memberService.signup(entity);
         return ResponseEntity.status(HttpStatus.OK).body(id);
     }

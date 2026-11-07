@@ -7,7 +7,6 @@ import com.lee.baby_datadog.member.dto.LoginRequestDto;
 import com.lee.baby_datadog.member.repository.MemberRepository;
 import com.lee.baby_datadog.security.util.JwtUtil;
 import lombok.RequiredArgsConstructor;
-import org.modelmapper.ModelMapper;
 import org.springframework.security.authentication.BadCredentialsException;
 import org.springframework.security.core.userdetails.UsernameNotFoundException;
 import org.springframework.security.crypto.password.PasswordEncoder;
@@ -24,7 +23,6 @@ public class MemberService {
     private final JwtUtil jwtUtil;
     private final MemberRepository memberRepository;
     private final PasswordEncoder encoder;
-    private final ModelMapper modelMapper;
 
     @Transactional
     public String login(LoginRequestDto dto){
@@ -38,7 +36,14 @@ public class MemberService {
             throw new BadCredentialsException("비밀번호가 일치하지 않습니다.");
         }
 
-        CustomUserInfoDto info = modelMapper.map(member, CustomUserInfoDto.class);
+        CustomUserInfoDto info = new CustomUserInfoDto(
+                member.getId(),
+                member.getEmail(),
+                member.getPassword(),
+                member.getName(),
+                member.getRole()
+        );
+
         return jwtUtil.createAccessToken(info);
     }
 
