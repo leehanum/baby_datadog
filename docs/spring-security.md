@@ -1,294 +1,183 @@
 # Spring Boot 4에서 Spring Security + JWT 적용하기
 
-[Spring Security와 JWT 적용 과정](https://prao.tistory.com/entry/Spring-Security-Spring-Security%EC%99%80-JWT-%EC%A0%81%EC%9A%A9-%EA%B3%BC%EC%A0%95) 글을 따라 실습하면서, 최신 버전 환경에 맞게 바꾼 부분을 정리했다.
-
-## 환경
+[Spring Security와 JWT 적용 과정](https://prao.tistory.com/entry/Spring-Security-Spring-Security%EC%99%80-JWT-%EC%A0%81%EC%9A%A9-%EA%B3%BC%EC%A0%95) 글을 따라 회원가입·로그인·JWT 인증을 구현했다. 코드를 따라 치는 것보다 **요청 하나가 Spring Security 안에서 어떤 순서로 처리되는지** 이해하는 데 초점을 두고 정리했다.
 
 | 항목 | 버전 |
 |---|---|
 | Spring Boot | 4.1.1 (Spring Security 7) |
 | Java | 21 |
-| 빌드 | Maven |
 | JWT 라이브러리 | jjwt 0.12.6 |
-| DB | MySQL 8.4 (Docker) |
+| 빌드 / DB | Maven / MySQL 8.4 |
 
-참고한 글은 Gradle + jjwt 0.11 기준이라 그대로 따라 하면 deprecated API나 컴파일 에러를 만나는 부분이 있다.
+## 1. 먼저 큰 그림: Spring Security는 필터 체인이다
 
-## 1. 의존성 추가
+Spring Security는 컨트롤러(DispatcherServlet) 앞에 놓인 **필터 묶음**이다. 모든 요청은 컨트롤러에 닿기 전에 이 필터들을 차례로 통과하고, 각 필터가 "이 요청은 누구인가(인증)", "이 요청을 허용할 것인가(인가)"를 나눠서 처리한다.
 
-```xml
-<dependency>
-	<groupId>io.jsonwebtoken</groupId>
-	<artifactId>jjwt-api</artifactId>
-	<version>0.12.6</version>
-</dependency>
-<dependency>
-	<groupId>io.jsonwebtoken</groupId>
-	<artifactId>jjwt-impl</artifactId>
-	<version>0.12.6</version>
-	<scope>runtime</scope>
-</dependency>
-<dependency>
-	<groupId>io.jsonwebtoken</groupId>
-	<artifactId>jjwt-jackson</artifactId>
-	<version>0.12.6</version>
-	<scope>runtime</scope>
-</dependency>
-```
+이번 구현에서 알아야 할 구성 요소는 이 정도다.
 
-### jjwt는 왜 3개나 넣어야 할까
-
-처음엔 `jjwt-api`, `jjwt-impl` 두 개면 될 거라고 생각했다. jjwt는 역할별로 jar가 나뉘어 있다.
-
-| artifact | 역할 | 빠지면 |
+| 구성 요소 | 역할 | 이 프로젝트에서 |
 |---|---|---|
-| `jjwt-api` | 코드에서 쓰는 인터페이스 (`Jwts`, `Claims` 등) | 컴파일 에러 |
-| `jjwt-impl` | 서명·파싱 실제 구현 | 런타임 에러 |
-| `jjwt-jackson` | Header/Payload를 JSON으로 직렬화·역직렬화 | 토큰 생성·파싱 시점에 런타임 에러 |
+| `SecurityFilterChain` | 어떤 필터를 쓰고 어떤 경로를 허용할지 설정 | `SecurityConfig` |
+| `UserDetails` | Security가 이해하는 사용자 정보 (아이디, 비밀번호, 권한) | `CustomUserDetails` |
+| `UserDetailsService` | 아이디로 사용자를 조회해 `UserDetails`로 반환 | `CustomUserDetailsService` |
+| `Authentication` | 인증된 사용자 정보 + 권한을 담은 객체 | `UsernamePasswordAuthenticationToken` |
+| `SecurityContextHolder` | 현재 요청의 `Authentication`을 보관하는 곳 | `JwtAuthFilter`가 채움 |
+| `PasswordEncoder` | 비밀번호 해시·비교 | `BCryptPasswordEncoder` |
+| `AuthenticationEntryPoint` / `AccessDeniedHandler` | 인증 실패(401) / 권한 부족(403) 응답 | `Custom...` 핸들러 |
 
-JWT의 Header와 Payload는 JSON이라 직렬화 구현체가 반드시 필요하다. jjwt는 이 구현체를 classpath에서 찾는데, 프로젝트에 Jackson이 이미 있어도 **jjwt와 Jackson을 연결하는 `jjwt-jackson`이 없으면 찾지 못한다.** 컴파일은 통과하고 토큰을 처음 만드는 순간에야 터지기 때문에 놓치기 쉽다.
+핵심은 **`SecurityContextHolder`에 `Authentication`이 들어 있으면 "인증된 요청"으로 취급된다**는 점이다. 세션 방식에서는 세션이 이걸 채워 주지만, JWT 방식에서는 매 요청마다 토큰을 검증해서 직접 채워 넣어야 한다. 그 일을 하는 게 커스텀 필터 `JwtAuthFilter`다.
 
-### `<scope>runtime</scope>`를 붙이는 이유
+## 2. SecurityConfig: JWT에 맞게 기본 동작 끄기
 
-`jjwt-impl`, `jjwt-jackson`을 runtime scope로 두면 코드에서 `io.jsonwebtoken.impl...` 같은 내부 구현 클래스를 import할 수 없다. 공개 API(`jjwt-api`)만 쓰도록 강제하는 것으로, jjwt 공식 문서에서도 이렇게 권장한다.
+Spring Security의 기본 설정은 세션 + 폼 로그인 기반이다. JWT를 쓰는 REST API에서는 이걸 끄고 필요한 것만 남긴다.
 
-## 2. JwtUtil: jjwt 0.11 → 0.12 마이그레이션
+```java
+http.csrf(AbstractHttpConfigurer::disable);
+http.sessionManagement(s -> s.sessionCreationPolicy(SessionCreationPolicy.STATELESS));
+http.formLogin(AbstractHttpConfigurer::disable);
+http.httpBasic(AbstractHttpConfigurer::disable);
 
-`JwtUtil`은 토큰 발급(`createAccessToken`), 검증(`isValidToken`), 내용 추출(`parseClaims`)을 담당한다. 참고 글의 코드를 그대로 옮기면 jjwt 0.12에서는 컴파일부터 안 된다.
+http.addFilterBefore(new JwtAuthFilter(customUserDetailsService, jwtUtil),
+        UsernamePasswordAuthenticationFilter.class);
+
+http.exceptionHandling(e -> e
+        .authenticationEntryPoint(customAuthenticationEntryPoint)
+        .accessDeniedHandler(accessDeniedHandler));
+
+http.authorizeHttpRequests(authorize -> authorize
+        .requestMatchers(AUTH_WHITELIST).permitAll()
+        .anyRequest().permitAll());
+```
+
+- **STATELESS**: 서버가 세션을 만들지도, 쓰지도 않는다. 사용자 상태는 토큰에만 있다.
+- **CSRF 비활성화**: CSRF 공격은 브라우저가 쿠키(세션)를 자동으로 실어 보내는 점을 노린다. 토큰을 `Authorization` 헤더에 직접 넣는 방식이라 꺼도 된다.
+- **formLogin / httpBasic 비활성화**: 로그인은 `/member/login` API가 직접 처리하므로 Security 기본 로그인 페이지와 Basic 인증은 필요 없다.
+- **`addFilterBefore`**: `JwtAuthFilter`를 `UsernamePasswordAuthenticationFilter` 앞에 넣어, 인가 판단 전에 SecurityContext가 채워지도록 한다.
+- **`exceptionHandling`**: 핸들러에 `@Component`만 붙여서는 Security가 쓰지 않는다. 여기서 등록해야 동작한다.
+- **`anyRequest().permitAll()`**: URL 단위로는 모두 열어 두고, 실제 권한 검사는 컨트롤러 메서드의 `@PreAuthorize`로 한다. 그래서 `@EnableMethodSecurity`를 붙였다.
+
+참고 글의 `@EnableGlobalMethodSecurity(prePostEnabled = true)`는 Security 7에서 deprecated다. `@EnableMethodSecurity`는 `prePostEnabled`가 기본으로 켜져 있다.
+
+## 3. 회원가입: 비밀번호는 해시로, 권한은 서버가 정한다
+
+회원가입 자체는 Security 필터와 거의 관계가 없다. 화이트리스트(`/member/signup`)라 인증 없이 들어와서 컨트롤러 → 서비스로 간다. Security와 관련된 포인트는 두 가지다.
+
+**① 비밀번호는 `PasswordEncoder`로 해시해서 저장한다.**
+
+```java
+member.updatePassword(encoder.encode(member.getPassword()));
+```
+
+DB에는 `$2a$10$...` 형태의 BCrypt 해시가 저장된다. BCrypt는 되돌릴 수 없고, 같은 비밀번호도 매번 다른 salt가 붙어 해시값이 달라진다. 그래서 로그인할 때는 복호화가 아니라 `encoder.matches(입력값, 저장된 해시)`로 비교한다.
+
+**② role은 요청에서 받지 않는다.**
+
+요청 DTO에 `role` 필드가 있으면 클라이언트가 `"role": "ADMIN"`을 보내 관리자로 가입할 수 있다. 요청 DTO에서는 role을 빼고 엔티티로 바꿀 때 `RoleType.USER`로 고정했다.
+
+## 4. 로그인: 검증 후 JWT 발급
 
 ```
-incompatible types: io.jsonwebtoken.ClaimsBuilder cannot be converted to io.jsonwebtoken.Claims
-cannot find symbol
-  symbol:   method parserBuilder()
-  location: class io.jsonwebtoken.Jwts
+POST /member/login (email, password)
+ → MemberService.login
+    1. 이메일로 회원 조회        (없으면 UsernameNotFoundException)
+    2. encoder.matches로 비밀번호 비교 (틀리면 BadCredentialsException)
+    3. JwtUtil.createAccessToken → 토큰 문자열 반환
 ```
 
-`Jwts` 클래스 자체는 그대로 있고 메서드가 바뀌었다. 0.12에서 builder/parser API가 정리되면서 `set` 접두사가 빠지고, 파싱 쪽 메서드 이름이 바뀌었다.
+여기서 알아 둘 점은, 이 로그인은 **Spring Security의 표준 인증 경로(`AuthenticationManager` → `AuthenticationProvider`)를 타지 않는다**는 것이다. 폼 로그인에서는 `UsernamePasswordAuthenticationFilter`가 아이디·비밀번호를 받아 `AuthenticationManager`에 넘기지만, 이번 구현은 formLogin을 끄고 서비스에서 직접 비교한 뒤 토큰을 만든다. 로그인 시점에 SecurityContext에 아무것도 저장하지 않고, 이후 요청부터 토큰으로 인증한다.
 
-IDE에서 보면 빨간 줄(컴파일 에러)과 취소선(deprecated)이 섞여 있는데, 둘은 성격이 다르다. 0.12.6 jar를 `javap`로 직접 열어 확인했다.
+### JWT에 무엇을 담나
 
-- **삭제·변경되어 컴파일 에러:** `Jwts.parserBuilder()`는 메서드가 아예 없다. `Jwts.claims()`는 남아 있지만 반환 타입이 `Claims`에서 `ClaimsBuilder`로 바뀌었다.
-- **deprecated라 아직 동작:** `setClaims`, `setIssuedAt`, `setExpiration`, `signWith(key, SignatureAlgorithm)`, `parseClaimsJws`. 지금은 컴파일되지만 1.0에서 제거될 예정이라 같이 바꿨다.
+토큰은 `Header.Payload.Signature` 세 부분이고, Payload에 회원 정보(claim)를 담는다.
+
+```java
+Claims claims = Jwts.claims()
+        .add("memberId", member.getMemberId())
+        .add("email", member.getEmail())
+        .add("name", member.getName())
+        .add("role", member.getRole().name())
+        .build();
+```
+
+Payload는 Base64로 인코딩만 되어 있어서 누구나 열어 볼 수 있다. **비밀번호 같은 민감 정보는 넣으면 안 된다.** 서명(Signature)은 내용을 숨기는 게 아니라, 서버의 secret key로 서명했기 때문에 **중간에 내용이 바뀌면 검증에서 실패하게 만드는** 장치다.
+
+claim에서 숫자를 꺼낼 때는 `(Long) claims.get("memberId")` 대신 `claims.get("memberId", Long.class)`로 타입을 넘긴다. JSON에는 Long/Integer 구분이 없어서 작은 숫자는 `Integer`로 읽히기 때문이다.
+
+### jjwt 0.11 → 0.12
+
+참고 글은 jjwt 0.11 기준이라 일부 API가 0.12에서 사라지거나 deprecated됐다.
 
 | 0.11 (참고 글) | 0.12 |
 |---|---|
-| `Key` | `SecretKey` |
-| `Jwts.claims()` + `claims.put(...)` → `setClaims(claims)` | `Jwts.builder().claim(k, v)` |
+| `Jwts.parserBuilder().setSigningKey(key)` | `Jwts.parser().verifyWith(key)` (`parserBuilder`는 삭제) |
+| `Jwts.claims()` → `Claims` | `Jwts.claims()` → `ClaimsBuilder` (`.add(...).build()`) |
 | `setSubject` / `setIssuedAt` / `setExpiration` | `subject` / `issuedAt` / `expiration` |
-| `signWith(key, SignatureAlgorithm.HS256)` | `signWith(key)` |
-| `Jwts.parserBuilder().setSigningKey(key)` | `Jwts.parser().verifyWith(key)` |
+| `signWith(key, SignatureAlgorithm.HS256)` | `signWith(key)` (키 길이로 알고리즘 결정) |
 | `parseClaimsJws(token).getBody()` | `parseSignedClaims(token).getPayload()` |
 
-`signWith(key)`는 키 길이를 보고 알고리즘을 정한다. `openssl rand -base64 64`로 만든 64바이트 키를 넣으니 Header가 `{"alg":"HS512"}`로 나왔다.
+또 jjwt는 `jjwt-api`, `jjwt-impl`, `jjwt-jackson` 세 개를 모두 넣어야 한다. 마지막 `jjwt-jackson`은 Header/Payload를 JSON으로 바꾸는 구현체라, 빠지면 컴파일은 되는데 토큰을 만드는 순간 런타임 에러가 난다.
 
-```java
-@Slf4j
-@Component
-public class JwtUtil {
+## 5. 인증이 필요한 요청: JwtAuthFilter
 
-	private final SecretKey key;
-	private final long accessTokenExpTime;
+로그인 이후 요청은 `Authorization: Bearer <토큰>` 헤더를 달고 온다. `JwtAuthFilter`가 하는 일은 결국 **"토큰이 유효하면 SecurityContext에 Authentication을 넣는다"** 하나다.
 
-	public JwtUtil(
-			@Value("${jwt.secret}") String secretKey,
-			@Value("${jwt.expiration_time}") long accessTokenExpTime) {
-		this.key = Keys.hmacShaKeyFor(Decoders.BASE64.decode(secretKey));
-		this.accessTokenExpTime = accessTokenExpTime;
-	}
-
-	public String createAccessToken(CustomUserInfoDto member) {
-		Date now = new Date();
-		Date expiration = new Date(now.getTime() + accessTokenExpTime);
-
-		return Jwts.builder()
-				.subject(String.valueOf(member.getMemberId()))
-				.claim("email", member.getEmail())
-				.claim("name", member.getName())
-				.claim("role", member.getRole().name())
-				.issuedAt(now)
-				.expiration(expiration)
-				.signWith(key)
-				.compact();
-	}
-
-	public Long getUserId(String token) {
-		return Long.valueOf(parseClaims(token).getSubject());
-	}
-
-	public boolean isValidToken(String token) {
-		try {
-			Jwts.parser().verifyWith(key).build().parseSignedClaims(token);
-			return true;
-		} catch (ExpiredJwtException e) {
-			log.info("Expired JWT: {}", e.getMessage());
-		} catch (JwtException | IllegalArgumentException e) {
-			log.info("Invalid JWT: {}", e.getMessage());
-		}
-		return false;
-	}
-
-	public Claims parseClaims(String token) {
-		try {
-			return Jwts.parser().verifyWith(key).build().parseSignedClaims(token).getPayload();
-		} catch (ExpiredJwtException e) {
-			return e.getClaims();
-		}
-	}
-}
+```
+요청 (Authorization: Bearer xxx)
+ → JwtAuthFilter
+    1. 헤더에서 "Bearer " 뒤 토큰 추출
+    2. jwtUtil.isValidToken  — 서명·만료 검증
+    3. 토큰에서 memberId 추출
+    4. CustomUserDetailsService.loadUserByUsername(memberId) — DB에서 회원 조회 → UserDetails
+    5. UsernamePasswordAuthenticationToken(userDetails, null, 권한) 생성
+    6. SecurityContextHolder.getContext().setAuthentication(...)
+ → 다음 필터 → (인가 검사) → 컨트롤러
 ```
 
-회원 ID는 별도 claim 대신 JWT 표준 필드인 `sub`(subject)에 넣었다. subject는 문자열이라 꺼낼 때 `Long.valueOf`로 바꾼다.
+몇 가지 짚어 둘 부분이 있다.
 
-### 함정 1: 만료 시간이 1000일이 된다
+- **`OncePerRequestFilter`**: 한 요청에서 필터가 두 번 실행되지 않도록 보장하는 Spring의 필터 베이스 클래스다.
+- **토큰이 없거나 틀려도 예외를 던지지 않는다.** SecurityContext를 비워 둔 채 `filterChain.doFilter`로 넘기기만 한다. 막을지 말지는 뒤에 있는 인가 단계가 결정한다. 그래서 화이트리스트 경로는 토큰 없이도 그대로 통과한다.
+- **`UsernamePasswordAuthenticationToken`의 두 번째 인자(credentials)는 `null`**: 이미 토큰으로 인증이 끝났으니 비밀번호를 들고 다닐 필요가 없다. 세 번째 인자로 권한을 넘기는 생성자를 쓰면 "인증 완료" 상태의 객체가 만들어진다.
+- **`UserDetails`의 username은 이메일이 아니라 memberId다.** `loadUserByUsername`이라는 이름과 달리, 토큰에서 꺼낸 memberId로 조회하도록 구현했다. Security는 username이 "사용자를 식별하는 문자열"이기만 하면 된다.
+- **권한에는 `ROLE_` 접두사를 붙인다.** `@PreAuthorize("hasRole('ADMIN')")`는 내부적으로 `ROLE_ADMIN` 권한을 찾기 때문에, `CustomUserDetails.getAuthorities()`에서 `"ROLE_" + role`로 만들어 준다.
 
-참고 글은 만료 시간을 이렇게 계산한다.
+## 6. 막힌 요청: 401과 403은 누가 가르나
 
-```java
-ZonedDateTime tokenValidity = now.plusSeconds(expireTime);
-```
+인가 단계에서 막히면 응답이 두 가지로 나뉜다.
 
-그런데 설정값 `jwt.expiration_time=86400000`은 **밀리초**(24시간)다. 이걸 `plusSeconds`에 넣으면 86,400,000초, 즉 **1000일짜리 토큰**이 만들어진다. 컴파일도 실행도 정상이라 알아채기 어렵다. 위 코드처럼 밀리초 기준으로 계산하거나, 설정값 단위를 초로 바꿔야 한다.
-
-### 함정 2: 서명이 틀린 토큰을 catch하지 못한다
-
-참고 글의 검증 코드는 예외를 이렇게 잡는다.
-
-```java
-} catch (SecurityException | MalformedJwtException e) {
-```
-
-`import io.jsonwebtoken.*;`로 import하면 여기서 `SecurityException`은 jjwt의 `io.jsonwebtoken.security.SecurityException`이 아니라 **`java.lang.SecurityException`**으로 해석된다. 와일드카드 import는 하위 패키지(`io.jsonwebtoken.security`)를 포함하지 않기 때문이다.
-
-다른 키로 서명한 토큰을 넣어 직접 확인해 보니, 이 catch 목록 중 어디에도 걸리지 않고 `io.jsonwebtoken.security.SignatureException`이 그대로 밖으로 던져졌다. `isValidToken`이 `false`를 반환하지 않고 예외를 던지면, 이걸 호출하는 JWT 필터에서 401이 아니라 500 에러가 난다.
-
-jjwt의 예외는 모두 `JwtException`을 상속하므로, 위 코드처럼 만료(`ExpiredJwtException`)만 따로 잡고 나머지는 `JwtException`으로 한 번에 잡는 편이 안전하다.
-
-### 함정 3: Long으로 넣은 claim이 Integer로 돌아온다
-
-회원 ID를 subject가 아니라 `claim("memberId", 1L)`처럼 커스텀 claim으로 넣으면, 파싱해서 꺼낼 때 타입이 바뀐다. 직접 확인한 결과는 이렇다.
-
-| 꺼내는 방법 | 결과 |
-|---|---|
-| `claims.get("memberId").getClass()` | `Integer` |
-| `(Long) claims.get("memberId")` | `ClassCastException` |
-| `claims.get("memberId", Long.class)` | `1` (정상) |
-
-토큰 payload는 JSON이라 숫자의 원래 타입 정보가 없고, Jackson은 작은 숫자를 `Integer`로 읽는다. 커스텀 claim에서 숫자를 꺼낼 때는 캐스팅하지 말고 `get(name, Long.class)`처럼 타입을 넘겨야 한다.
-
-## 3. 401과 403 나누기: AuthenticationEntryPoint vs AccessDeniedHandler
-
-JWT 필터까지 만들고 나면, 막힌 요청에 어떤 응답을 줄지 정해야 한다. 참고 글은 핸들러를 두 개 만든다. 이름이 비슷해서 처음엔 헷갈렸는데, 기준은 하나다. **"누구인지 모르면" EntryPoint, "누구인지는 아는데 권한이 없으면" AccessDeniedHandler**다.
-
-| | `CustomAuthenticationEntryPoint` | `CustomAccessDeniedHandler` |
+| | `AuthenticationEntryPoint` | `AccessDeniedHandler` |
 |---|---|---|
-| 상황 | 인증 실패 (토큰 없음, 만료, 위조) | 인증은 됐지만 권한 부족 (USER가 ADMIN API 호출) |
-| 구현 인터페이스 | `AuthenticationEntryPoint` | `AccessDeniedHandler` |
-| 메서드 | `commence(...)` | `handle(...)` |
+| 상황 | 누구인지 모름 (토큰 없음·만료·위조) | 누구인지는 아는데 권한 부족 (USER가 ADMIN API 호출) |
 | 응답 | 401 UNAUTHORIZED | 403 FORBIDDEN |
 
-EntryPoint라는 이름은 원래 폼 로그인 시절, 미인증 사용자를 로그인 페이지로 보내 "인증을 시작하게 하는 입구"라는 뜻에서 왔다. JWT 기반 REST API에는 로그인 페이지가 없으니, 리다이렉트 대신 401 JSON을 내려주도록 직접 구현한다.
-
-### 두 핸들러는 등록해야 동작한다
-
-`@Component`를 붙이면 빈으로 등록되지만, Security가 그 빈을 알아서 가져다 쓰지는 않는다. `SecurityConfig`에서 예외 처리 담당으로 지정해야 한다.
-
-```java
-http.exceptionHandling(exceptionHandling -> exceptionHandling
-		.authenticationEntryPoint(customAuthenticationEntryPoint)
-		.accessDeniedHandler(accessDeniedHandler));
-```
-
-### 401과 403은 누가 어떻게 가르나
-
-여기가 가장 헷갈렸던 부분이다. 직관적으로는 "인증 실패 예외"와 "권한 부족 예외"가 따로 터질 것 같지만, 인가 검사에서 막히면 **두 경우 모두 `AccessDeniedException`이 던져진다.** 이 예외를 잡아서 어느 핸들러로 보낼지 정하는 건 `ExceptionTranslationFilter`다.
-
-Security 7.1.1의 기본 필터 순서를 확인해 보면 관련 필터는 이 순서로 놓인다. `JwtAuthFilter`는 `addFilterBefore`로 `UsernamePasswordAuthenticationFilter` 앞에 넣었다.
+헷갈리는 부분은, 인가 검사(`AuthorizationFilter`나 `@PreAuthorize`)에서 막히면 **두 경우 모두 똑같이 `AccessDeniedException`이 던져진다**는 점이다. 이걸 잡아서 둘 중 어디로 보낼지는 그 앞에 있는 `ExceptionTranslationFilter`가 정한다.
 
 ```
-JwtAuthFilter                    토큰이 유효하면 SecurityContext에 인증 정보 저장
-→ AnonymousAuthenticationFilter  SecurityContext가 비어 있으면 익명 사용자로 채움
-→ ExceptionTranslationFilter     뒤에서 올라온 예외를 잡아 401/403 분기
-→ AuthorizationFilter            URL 권한 검사, 실패하면 AccessDeniedException
-→ 컨트롤러(@PreAuthorize)        메서드 권한 검사, 실패하면 AccessDeniedException
+JwtAuthFilter                    토큰이 유효하면 SecurityContext 채움
+→ AnonymousAuthenticationFilter  비어 있으면 "익명 사용자"로 채움
+→ ExceptionTranslationFilter     뒤에서 올라온 예외를 잡아 분기
+→ AuthorizationFilter / @PreAuthorize   권한 검사, 실패하면 AccessDeniedException
 ```
 
-`ExceptionTranslationFilter`가 인가 검사보다 **앞**에 있어서, 뒤에서 터진 예외가 거슬러 올라오다 여기서 잡힌다. 7.1.1 jar의 `handleAccessDeniedException`을 `javap`로 열어보니 분기는 이랬다.
+`ExceptionTranslationFilter`는 현재 사용자가 익명이면 EntryPoint(401)로, 인증된 사용자면 AccessDeniedHandler(403)로 보낸다. 결국 **401과 403을 가르는 건 예외 종류가 아니라 SecurityContext에 인증된 사용자가 있느냐**이고, 그걸 채우는 게 `JwtAuthFilter`다.
 
-```java
-// 단순화한 흐름
-if (trustResolver.isAnonymous(authentication) || trustResolver.isRememberMe(authentication)) {
-	// InsufficientAuthenticationException으로 감싸서
-	sendStartAuthentication(...);        // → AuthenticationEntryPoint → 401
-} else {
-	accessDeniedHandler.handle(...);     // → AccessDeniedHandler → 403
-}
-```
-
-결국 401과 403을 가르는 건 예외 종류가 아니라 **그 순간 SecurityContext에 인증된 사용자가 있느냐**다. 그리고 이걸 채우는 게 `JwtAuthFilter`다. 한 요청에서 두 핸들러가 함께 불리는 일은 없고, 인증 여부를 먼저 보기 때문에 미인증 사용자는 403까지 가지 않고 401로 끝난다.
-
-| 요청 (`@PreAuthorize("hasRole('ADMIN')")` API) | SecurityContext | 처리 |
+| 요청 (`@PreAuthorize("hasRole('ADMIN')")` API) | SecurityContext | 결과 |
 |---|---|---|
-| 토큰 없음 / 만료 | 익명 사용자 | EntryPoint → 401 |
-| USER 토큰 | `ROLE_USER` | AccessDeniedHandler → 403 |
+| 토큰 없음 / 만료 | 익명 사용자 | 401 |
+| USER 토큰 | `ROLE_USER` | 403 |
 | ADMIN 토큰 | `ROLE_ADMIN` | 통과 |
 
-### 실수하기 쉬운 부분: 본문과 상태 코드는 따로 설정된다
+JWT REST API에는 로그인 페이지가 없으니, 두 핸들러 모두 리다이렉트 대신 JSON 에러 응답을 직접 써서 내려준다. 이때 클라이언트가 받는 HTTP 상태 코드는 응답 DTO 안의 숫자가 아니라 `response.setStatus()`로 정해진다. 참고 글의 `AccessDeniedHandler`는 설명은 403인데 `setStatus`에 `UNAUTHORIZED`가 들어가 있어서, 그대로 쓰면 권한 부족 사용자에게 401이 나간다. 두 곳 모두 `FORBIDDEN`으로 맞췄다.
 
-`AccessDeniedHandler`를 작성하면서 처음에 이렇게 써 두었다.
+Boot 4는 Jackson 3를 쓰기 때문에, 핸들러에서 쓰는 `ObjectMapper`는 `com.fasterxml.jackson.databind`가 아니라 `tools.jackson.databind` 패키지다.
 
-```java
-ErrorResponseDto errorResponseDto = new ErrorResponseDto(HttpStatus.FORBIDDEN.value(), ...);
-response.setStatus(HttpStatus.UNAUTHORIZED.value());
-```
-
-`ErrorResponseDto`의 status는 JSON 본문에 들어가는 숫자일 뿐이고, 클라이언트가 실제로 받는 HTTP 상태 코드는 `response.setStatus()`로 정해진다. 이대로면 권한이 없는 사용자에게 상태 코드 401이 나간다. 프론트가 401을 보고 로그인 페이지로 보내는 식으로 분기하면, 이미 로그인한 사용자가 다시 로그인하라는 안내를 받게 된다. 두 곳 모두 `FORBIDDEN`으로 맞췄다.
-
-`@Slf4j(topic = "FORBIDDEN_EXCEPTION_HANDLER")`의 topic은 로그에 찍히는 로거 이름일 뿐이라 상태 코드와는 관계가 없다.
-
-### 참고 글과 달라진 점
-
-- **Jackson 3:** Boot 4는 Jackson 3를 쓰기 때문에 핸들러에서 쓰는 `ObjectMapper`의 패키지가 `com.fasterxml.jackson.databind`가 아니라 `tools.jackson.databind`다.
-- **`@EnableGlobalMethodSecurity`:** 7.1.1 jar에 아직 남아 있어서 컴파일은 되지만 deprecated다. 대체 어노테이션은 `@EnableMethodSecurity`이고, `prePostEnabled`가 기본값 true라 `@EnableMethodSecurity(securedEnabled = true)`면 된다.
-
-## 4. 회원가입 확인
-
-### role은 요청에서 받지 않는다
-
-회원가입 요청 DTO에 `role` 필드를 두면 클라이언트가 `"role": "ADMIN"`을 보내 관리자로 가입할 수 있다. 요청 DTO에서는 role을 빼고, 엔티티로 바꿀 때 서버에서 고정했다.
-
-```java
-public Member toEntity() {
-	return Member.builder()
-			.email(email)
-			.password(password)
-			.name(name)
-			.role(RoleType.USER)
-			.build();
-}
-```
-
-### DB에서 직접 확인
-
-Postman으로 `POST /member/signup`을 보낸 뒤 Docker의 MySQL에서 확인했다.
-
-```bash
-docker exec -it baby-mysql mysql -uroot -proot baby_datadog
-```
+## 정리
 
 ```
-mysql> select member_id, email, left(password, 10) as pw, name, role from member;
-member_id  email          pw          name  role
-1          test@test.com  $2a$10$CiF  lee   USER
+[회원가입] 화이트리스트 → 비밀번호 BCrypt 해시, role=USER 고정 → 저장
+[로그인]   화이트리스트 → 이메일 조회 + matches 비교 → JWT 발급
+[API 요청] JwtAuthFilter: 토큰 검증 → UserDetails 조회 → SecurityContext에 저장
+           → 인가 검사 → 통과 / 익명이면 401 / 권한 부족이면 403
 ```
 
-비밀번호는 BCrypt 해시(`$2a$10$...`)로, role은 `USER`로 저장됐다. BCrypt는 되돌릴 수 없는 해시라 로그인할 때는 복호화가 아니라 `passwordEncoder.matches(입력값, 저장된 해시)`로 비교한다.
-
-### 함정: `@Table(name = "MEMBER")`인데 `MEMBER` 테이블이 없다
-
-엔티티에 `@Table(name = "MEMBER")`로 적어 두어서 SQL도 대문자로 쳤더니 에러가 났다.
-
-```
-ERROR 1146 (42S02): Table 'baby_datadog.MEMBER' doesn't exist
-```
-
-`show tables`로 보면 실제 테이블 이름은 소문자 `member`다. Spring Boot가 기본으로 쓰는 Hibernate 네이밍 전략이 테이블·컬럼 이름을 소문자 snake_case로 바꾸기 때문이다. 그리고 Docker의 MySQL은 Linux 위에서 돌아서 테이블 이름의 대소문자를 구분한다. 결국 `@Table`에 뭐라고 적었든, DB에 직접 쿼리할 때는 `show tables`로 실제 이름을 확인하는 게 빠르다.
+세션 방식에서 서버가 기억하던 "이 사용자는 로그인했다"는 상태를, JWT 방식에서는 토큰이 대신 들고 다니고 `JwtAuthFilter`가 매 요청마다 SecurityContext로 옮겨 놓는다. 이 한 줄이 이해되면 나머지 설정은 그걸 위한 준비 작업이다.
